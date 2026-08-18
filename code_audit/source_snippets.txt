@@ -1,0 +1,142 @@
+### SOURCE SNIPPETS backing AUDIT_VERDICTS.md (urunc 0.7.0, HEAD 3a70c43)
+
+===== BLOCKER 1: pkg/network/network.go — addRedirectFilter (catch-all steal) =====
+func addRedirectFilter(source netlink.Link, target netlink.Link) error {
+	return netlink.FilterAdd(&netlink.U32{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: source.Attrs().Index,
+			Parent:    netlink.MakeHandle(0xffff, 0),
+			Protocol:  unix.ETH_P_ALL,
+		},
+		Actions: []netlink.Action{
+			&netlink.MirredAction{
+				ActionAttrs: netlink.ActionAttrs{
+					Action: netlink.TC_ACT_STOLEN,
+				},
+				MirredAction: netlink.TCA_EGRESS_REDIR,
+				Ifindex:      target.Attrs().Index,
+			},
+		},
+	})
+}
+
+===== BLOCKER 1: pkg/network/network_dynamic.go — single-workload design note (#13) =====
+// If no TAP devices are available in the current netns, it creates a new tap device and
+// sets TC rules between the veth interface and the tap device inside the namespace.
+//
+// FIXME: CUrrently only one tap device per netns can provide functional networking. We need to find a proper way to handle networking
+// for multiple unikernels in the same pod/network namespace.
+// See: https://github.com/urunc-dev/urunc/issues/13
+func (n DynamicNetwork) NetworkSetup(uid uint32, gid uint32) (*UnikernelNetworkInfo, error) {
+	tapIndex, err := getTapIndex()
+	if err != nil {
+		return nil, fmt.Errorf("getTapIndex failed: %w", err)
+	}
+	if tapIndex > 0 {
+		return nil, fmt.Errorf("unsupported operation: can't spawn multiple unikernels in the same network namespace")
+	}
+
+	redirectLink, err := discoverContainerIface()
+	if err != nil {
+
+===== BLOCKER 2: SupportsSharedfs + UsesKVM per monitor =====
+--- spt.go ---
+func (s *SPT) SupportsSharedfs(_ string) bool {
+	return false
+--- hvt.go ---
+func (h *HVT) SupportsSharedfs(_ string) bool {
+	return false
+--- firecracker.go ---
+func (fc *Firecracker) SupportsSharedfs(_ string) bool {
+	return false
+--- hedge.go ---
+func (h *Hedge) SupportsSharedfs(_ string) bool {
+	return false
+--- qemu.go ---
+func (q *Qemu) SupportsSharedfs(_ string) bool {
+	return true
+--- cloud_hypervisor.go ---
+func (ch *CloudHypervisor) SupportsSharedfs(fsType string) bool {
+
+===== BLOCKER 2: rootfs.go — two-sided shared-fs gate =====
+// tryVirtiofs checks if virtiofs can be used
+func (rs *rootfsSelector) tryVirtiofs() (types.RootfsParams, bool) {
+	if !rs.unikernel.SupportsFS("virtiofs") {
+		return types.RootfsParams{}, false
+	}
+
+	if !rs.vmm.SupportsSharedfs("virtio") {
+		return types.RootfsParams{}, false
+	}
+
+	if !fileExists(rs.vfsdPath) {
+		return types.RootfsParams{}, false
+	}
+
+	return newRootfsResult("virtiofs", rs.cntrRootfs, rs.cntrRootfs, rs.cntrRootfs), true
+}
+
+// try9pfs checks if 9pfs can be used
+func (rs *rootfsSelector) try9pfs() (types.RootfsParams, bool) {
+	if !rs.unikernel.SupportsFS("9pfs") {
+		return types.RootfsParams{}, false
+	}
+
+	if !rs.vmm.SupportsSharedfs("9p") {
+		return types.RootfsParams{}, false
+	}
+
+	return newRootfsResult("9pfs", rs.cntrRootfs, rs.cntrRootfs, rs.cntrRootfs), true
+}
+
+===== BLOCKER 3: SetupNet (attaches on pod eth0, not guest capability) =====
+func (u *Unikontainer) SetupNet() (types.NetDevParams, error) {
+	networkType := u.getNetworkType()
+	uniklog.WithField("network type", networkType).Debug("Retrieved network type")
+	netArgs := types.NetDevParams{}
+	netManager, err := network.NewNetworkManager(networkType)
+	if err != nil {
+		return netArgs, fmt.Errorf("failed to create network manager for %s type: %v", networkType, err)
+	}
+
+	networkInfo, err := netManager.NetworkSetup(u.Spec.Process.User.UID, u.Spec.Process.User.GID)
+	if err != nil {
+		// TODO: Handle this case better. We do not need to show an error
+		// since there was no network in the container. Therefore, we
+		// need better error handling and specifically check if the container
+		// di not have any network.
+		uniklog.Errorf("Failed to setup network :%v. Possibly due to ctr", err)
+	}
+	// if network info is nil, we didn't find eth0, so we are running with ctr
+	if networkInfo != nil {
+		netArgs.TapDev = networkInfo.TapDevice
+		netArgs.IP = networkInfo.EthDevice.IP
+		netArgs.Mask = networkInfo.EthDevice.Mask
+		netArgs.Gateway = networkInfo.EthDevice.DefaultGateway
+		// The MAC address for the guest network device is the same as the
+		// virtual ethernet interface inside the namespace
+		netArgs.MAC = networkInfo.EthDevice.MAC
+		netArgs.MTU = networkInfo.EthDevice.MTU
+	}
+
+	return netArgs, nil
+}
+
+
+===== BLOCKER 3: spt.go — net flag appended purely on TapDev presence =====
+	sptMem := BytesToStringMB(args.MemSizeB)
+	cmdString := s.binaryPath + " --mem=" + sptMem
+	if args.Net.TapDev != "" {
+		cmdString += " "
+		cmdString += ukernel.MonitorNetCli(args.Net.TapDev, args.Net.MAC)
+	}
+	bArgs := ukernel.MonitorBlockCli()
+
+===== BLOCKER 3: rootfs.go:400 — 'always include tun / decide in Exec by pod network' =====
+	// The tun device is always included because in urunc create we can not know
+	// if there will be a virtual ethernet device or not, since the CNI hooks
+	// have not executed yet. Therefore, the decision about whether it is actually
+	// created in the monitor rootfs is decided in Exec, which checks the
+	// network configuration. However, if the host does not have the "/dev/net/tun"
+	// device then simply skip it and fail later if the container requires network
+	tunDev, err := deviceFromHost("/dev/net/tun")

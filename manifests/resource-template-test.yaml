@@ -1,0 +1,35 @@
+# EVIDENCE: Argo resource-template path completes via k8s-API watch where the
+# container/emissary path hangs forever. This one drives a REAL solo5-spt mirage
+# unikernel; it reaches Pod phase=Failed (net-less abort, §3.1) and Argo's
+# resource executor detects that terminal state via the API and finishes the
+# workflow node in ~11s (2026-08-10T13:01:38Z -> 13:01:49Z).
+#
+# Apply:  sudo k3s kubectl apply -f resource-template-test.yaml
+# Watch:  sudo k3s kubectl get wf urunc-resource-test -n argo -o wide
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: urunc-resource-test
+  namespace: argo
+spec:
+  serviceAccountName: argo
+  entrypoint: run-uni
+  templates:
+  - name: run-uni
+    resource:
+      action: create
+      setOwnerReference: true
+      successCondition: status.phase == Succeeded
+      failureCondition: status.phase == Failed
+      manifest: |
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          generateName: urunc-res-pod-
+        spec:
+          runtimeClassName: urunc
+          restartPolicy: Never
+          containers:
+          - name: main
+            image: harbor.nbfc.io/nubificus/urunc/hello-spt-mirage:latest
+            args: ["--hello=ResourceTest"]

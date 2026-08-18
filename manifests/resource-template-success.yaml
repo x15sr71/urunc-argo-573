@@ -1,0 +1,36 @@
+# EVIDENCE: resource-template SUCCESS detection via k8s API.
+# A runtimeClassName=urunc pod that exits 0 (plain busybox -> delegated to runc)
+# reaches Pod phase=Succeeded; Argo's resource executor detects it via the API
+# and completes the workflow as Succeeded in ~11s (13:03:13Z -> 13:03:24Z).
+#
+# NOTE: success detection is proven here with a runc-delegated pod because on
+# this KVM-less, spt-only VM no *unikernel* image can reach Pod=Succeeded (the
+# §3.1 net-less-tap bug aborts net-less mirage; net-spt-mirage never exits;
+# rumprun StartErrors under the overlayfs snapshotter). See code_audit/AUDIT_VERDICTS.md.
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: urunc-resource-success
+  namespace: argo
+spec:
+  serviceAccountName: argo
+  entrypoint: run
+  templates:
+  - name: run
+    resource:
+      action: create
+      setOwnerReference: true
+      successCondition: status.phase == Succeeded
+      failureCondition: status.phase == Failed
+      manifest: |
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          generateName: urunc-res-ok-
+        spec:
+          runtimeClassName: urunc
+          restartPolicy: Never
+          containers:
+          - name: main
+            image: busybox:latest
+            command: ["sh","-c","echo hello-from-resource-template; exit 0"]

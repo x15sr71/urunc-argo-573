@@ -1,0 +1,441 @@
+diff --git a/pkg/containerd-shim/task_service.go b/pkg/containerd-shim/task_service.go
+index 3f5dad6..947408c 100644
+--- a/pkg/containerd-shim/task_service.go
++++ b/pkg/containerd-shim/task_service.go
+@@ -16,13 +16,49 @@ package containerdshim
+ 
+ import (
+ 	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync"
+ 
+ 	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
+ 	"github.com/containerd/log"
+ 	"github.com/containerd/ttrpc"
++	specs "github.com/opencontainers/runtime-spec/specs-go"
+ 	containerdShim "github.com/urunc-dev/urunc/pkg/containerd-shim/containerd"
+ )
+ 
++const (
++	annotSandboxProfile = "com.urunc.unikernel.sandboxProfile"
++	annotArgoOutputVol  = "com.urunc.unikernel.argoOutputVolume"
++	annotUnikernelType  = "com.urunc.unikernel.unikernelType"
++	sandboxProfileArgo  = "argo-workflow"
++
++	// maxExtractBytes caps the total data copied out of a guest block volume
++	// into the shared Argo emptyDir, bounding the synchronous work done in the
++	// Delete hook so a large or malformed volume cannot stall teardown.
++	maxExtractBytes = 64 << 20 // 64 MiB
++)
++
++// argoTask records, per Argo main container, where completion + output data
++// must land. It is populated at Create and consumed once at Delete.
++type argoTask struct {
++	// exitDir is <argoEmptyDirSource>/ctr/<name>; the "exitcode" file goes here.
++	exitDir string
++	// outputSrc is the host path of the guest's declared output block volume
++	// (empty when none was declared). After the runtime restores the block
++	// volume during Delete, this path holds the guest-written files.
++	outputSrc string
++	// outputDest is <argoEmptyDirSource>/outputs; extracted files land here,
++	// visible to the trusted wait sidecar sharing the same emptyDir.
++	outputDest string
++}
++
+ // taskService is urunc's shim-side wrapper around containerd's runc task
+ // service. It wires urunc task setup before forwarding calls to the wrapped
+ // service.
+@@ -30,6 +66,12 @@ type taskService struct {
+ 	taskAPI.TaskService
+ 
+ 	containerdAddress string
++
++	// argoTasks maps a container ID to its Argo completion/extraction context.
++	// Populated at Create only for Argo "main" containers; empty (and every
++	// code path it guards inert) for every other workload.
++	mu        sync.Mutex
++	argoTasks map[string]*argoTask
+ }
+ 
+ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*taskAPI.CreateTaskResponse, error) {
+@@ -52,27 +94,263 @@ func (s *taskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequest)
+ 		return resp, err
+ 	}
+ 
++	// Argo integration: if this is an Argo "main" container, remember where to
++	// drop the completion file and (optionally) which guest block volume holds
++	// outputs to extract. urunc execs straight into the VMM and discards Argo's
++	// argoexec wrapper, so argoexec never writes the exitcode file that the wait
++	// sidecar polls, nor stages outputs. We do both from Delete once the guest's
++	// real exit status is known. Non-Argo containers are untouched.
++	if at, ok := parseArgoTask(r.Bundle); ok {
++		s.mu.Lock()
++		if s.argoTasks == nil {
++			s.argoTasks = make(map[string]*argoTask)
++		}
++		s.argoTasks[r.ID] = at
++		s.mu.Unlock()
++		log.G(ctx).WithField("exitDir", at.exitDir).WithField("outputSrc", at.outputSrc).
++			Info("urunc(shim): tracking Argo main container")
++	}
++
+ 	// TODO: #816 - Restore rootfs choice here once shim integration is complete.
+ 	// For now, rootfs is selected during urunc create (InitialSetup phase).
+-	// ChooseRootfs after inner task Create so bundle rootfs is mounted;
+-	// params are persisted in bundle config.json for runtime Exec.
+-	// if err := chooseGuestRootfs(r); err != nil {
+-	// 	if errors.Is(err, errGuestRootfsChoiceSkipped) {
+-	// 		log.G(ctx).WithError(err).Debug("urunc(shim): guest rootfs choice skipped")
+-	// 		return resp, nil
+-	// 	}
+-	// 	log.G(ctx).WithError(err).Warn("urunc(shim): failed to choose guest rootfs")
+-	// 	return nil, err
+-	// }
+ 
+ 	return resp, nil
+ }
+ 
+ func (s *taskService) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAPI.DeleteResponse, error) {
+-	return s.TaskService.Delete(ctx, r)
++	// The inner Delete runs "urunc delete", which restores (remounts host-side)
++	// the guest's block volume before returning. So by the time it returns, any
++	// declared output volume is readable at at.outputSrc.
++	resp, err := s.TaskService.Delete(ctx, r)
++	if err != nil {
++		return resp, err
++	}
++
++	s.mu.Lock()
++	at, ok := s.argoTasks[r.ID]
++	if ok {
++		delete(s.argoTasks, r.ID)
++	}
++	s.mu.Unlock()
++
++	if !ok || resp == nil {
++		return resp, nil
++	}
++
++	// 1. Extract guest outputs into the shared emptyDir (best-effort). This runs
++	//    strictly before the completion file so the wait sidecar never observes
++	//    completion before the artifacts are on disk.
++	if at.outputSrc != "" {
++		if n, cerr := copyOutputs(at.outputSrc, at.outputDest); cerr != nil {
++			log.G(ctx).WithError(cerr).WithField("src", at.outputSrc).
++				Warn("urunc(shim): Argo output extraction failed (continuing to signal completion)")
++		} else if n > 0 {
++			log.G(ctx).WithField("dest", at.outputDest).WithField("files", n).
++				Info("urunc(shim): extracted Argo outputs")
++		}
++	}
++
++	// 2. Signal completion LAST.
++	if werr := writeArgoExitcode(at.exitDir, resp.ExitStatus); werr != nil {
++		log.G(ctx).WithError(werr).Warn("urunc(shim): failed to write Argo exitcode file")
++	} else {
++		log.G(ctx).WithField("dir", at.exitDir).WithField("code", resp.ExitStatus).
++			Info("urunc(shim): wrote Argo completion file")
++	}
++
++	return resp, nil
+ }
+ 
+ func (s *taskService) RegisterTTRPC(server *ttrpc.Server) error {
+ 	taskAPI.RegisterTaskService(server, s)
+ 	return nil
+ }
++
++// isArgoEmissaryArgs reports whether an OCI process was rewritten by Argo's
++// emissary executor ("<path>/argoexec emissary -- <user cmd>"). Nil-safe.
++func isArgoEmissaryArgs(p *specs.Process) bool {
++	if p == nil || len(p.Args) < 2 {
++		return false
++	}
++	return filepath.Base(p.Args[0]) == "argoexec" && p.Args[1] == "emissary"
++}
++
++// parseArgoTask inspects the OCI bundle and, if it belongs to an Argo "main"
++// container, returns its completion/extraction context. Resolution of "is this
++// Argo": the sandboxProfile annotation is authoritative when present
++// ("argo-workflow" enables, any other explicit value disables); an absent
++// annotation falls back to emissary argv detection. Any parse failure or
++// non-Argo container returns (nil, false), preserving legacy behavior.
++func parseArgoTask(bundle string) (*argoTask, bool) {
++	data, err := os.ReadFile(filepath.Join(bundle, "config.json"))
++	if err != nil {
++		return nil, false
++	}
++	var spec specs.Spec
++	if err := json.Unmarshal(data, &spec); err != nil {
++		return nil, false
++	}
++	switch spec.Annotations[annotSandboxProfile] {
++	case sandboxProfileArgo:
++		// enabled explicitly
++	case "":
++		if !isArgoEmissaryArgs(spec.Process) {
++			return nil, false
++		}
++	default:
++		return nil, false
++	}
++
++	// Scope strictly to the unikernel "main" container. urunc runs only
++	// containers carrying the unikernel annotations as a VMM, exactly as
++	// cmd/urunc/create.go distinguishes them (ErrNotUnikernel) from Argo's
++	// argoexec init/wait sidecars, which are delegated to runc. The
++	// sandboxProfile annotation is pod-scoped, so without this check it would
++	// also match those sidecars and write spurious completion files for them.
++	if spec.Annotations[annotUnikernelType] == "" {
++		return nil, false
++	}
++
++	// Host path backing the /var/run/argo emptyDir shared with the wait sidecar.
++	argoSrc := ""
++	for i := range spec.Mounts {
++		if spec.Mounts[i].Destination == "/var/run/argo" {
++			argoSrc = spec.Mounts[i].Source
++			break
++		}
++	}
++	if argoSrc == "" {
++		return nil, false
++	}
++
++	name := spec.Annotations["io.kubernetes.cri.container-name"]
++	if name == "" {
++		name = "main"
++	}
++
++	at := &argoTask{
++		exitDir:    filepath.Join(argoSrc, "ctr", name),
++		outputDest: filepath.Join(argoSrc, "outputs"),
++	}
++
++	// Optional: a declared output block volume. The annotation names the guest
++	// mount destination; its backing host Source (readable after the runtime
++	// restores the block volume during Delete) is what we extract.
++	if dst := spec.Annotations[annotArgoOutputVol]; dst != "" {
++		for i := range spec.Mounts {
++			if spec.Mounts[i].Destination == dst {
++				at.outputSrc = spec.Mounts[i].Source
++				break
++			}
++		}
++	}
++	return at, true
++}
++
++// writeArgoExitcode writes Argo's completion file: <dir>/exitcode containing the
++// guest's exit status as a decimal string, matching what argoexec's emissary
++// executor would have written. The wait sidecar's inotify watch then observes
++// completion and the workflow node finishes.
++func writeArgoExitcode(dir string, code uint32) error {
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return fmt.Errorf("mkdir %s: %w", dir, err)
++	}
++	path := filepath.Join(dir, "exitcode")
++	if err := os.WriteFile(path, []byte(strconv.Itoa(int(code))), 0o644); err != nil {
++		return fmt.Errorf("write %s: %w", path, err)
++	}
++	return nil
++}
++
++// copyOutputs recursively copies regular files from srcDir into destDir,
++// preserving the relative directory structure. It returns the number of files
++// copied. Security guards for untrusted, guest-authored content:
++//   - symlinks (and any non-regular file) are skipped, never followed, so the
++//     copy cannot escape srcDir or destDir via a crafted link;
++//   - a path that would resolve outside destDir is rejected;
++//   - the total number of bytes copied is capped at maxExtractBytes.
++//
++// A missing srcDir is not an error (returns 0): a guest may declare an output
++// volume but write nothing.
++func copyOutputs(srcDir, destDir string) (int, error) {
++	info, err := os.Stat(srcDir)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return 0, nil
++		}
++		return 0, err
++	}
++	if !info.IsDir() {
++		return 0, fmt.Errorf("output source %s is not a directory", srcDir)
++	}
++
++	var copied int
++	var total int64
++	walkErr := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		// Skip symlinks and any non-regular, non-dir entry: never follow them.
++		if d.Type()&fs.ModeSymlink != 0 {
++			return nil
++		}
++		rel, err := filepath.Rel(srcDir, path)
++		if err != nil {
++			return err
++		}
++		if rel == "." {
++			return nil
++		}
++		// Defense in depth: reject any relative path that escapes destDir.
++		if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
++			return fmt.Errorf("refusing path escaping output dir: %s", rel)
++		}
++		target := filepath.Join(destDir, rel)
++
++		if d.IsDir() {
++			return os.MkdirAll(target, 0o755)
++		}
++		if !d.Type().IsRegular() {
++			return nil
++		}
++		fi, err := d.Info()
++		if err != nil {
++			return err
++		}
++		if total+fi.Size() > maxExtractBytes {
++			return fmt.Errorf("output extraction exceeds %d byte cap", int64(maxExtractBytes))
++		}
++		n, err := copyFile(path, target)
++		if err != nil {
++			return err
++		}
++		total += n
++		copied++
++		return nil
++	})
++	if walkErr != nil {
++		return copied, walkErr
++	}
++	return copied, nil
++}
++
++// copyFile copies a single regular file, creating parent dirs. Returns bytes written.
++func copyFile(src, dst string) (int64, error) {
++	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
++		return 0, err
++	}
++	in, err := os.Open(src)
++	if err != nil {
++		return 0, err
++	}
++	defer in.Close()
++	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
++	if err != nil {
++		return 0, err
++	}
++	n, err := io.Copy(out, in)
++	if cerr := out.Close(); err == nil {
++		err = cerr
++	}
++	return n, err
++}
+diff --git a/pkg/unikontainers/config.go b/pkg/unikontainers/config.go
+index 14a4cb1..03c42c4 100644
+--- a/pkg/unikontainers/config.go
++++ b/pkg/unikontainers/config.go
+@@ -36,16 +36,22 @@ var ErrEmptyAnnotations = errors.New("spec annotations are empty")
+ // Urunc specific annotations
+ // ALways keep it in sync with the struct UnikernelConfig struct
+ const (
+-	annotType          = "com.urunc.unikernel.unikernelType"
+-	annotVersion       = "com.urunc.unikernel.unikernelVersion"
+-	annotBinary        = "com.urunc.unikernel.binary"
+-	annotCmdLine       = "com.urunc.unikernel.cmdline"
+-	annotHypervisor    = "com.urunc.unikernel.hypervisor"
+-	annotInitrd        = "com.urunc.unikernel.initrd"
+-	annotBlock         = "com.urunc.unikernel.block"
+-	annotBlockMntPoint = "com.urunc.unikernel.blkMntPoint"
+-	annotMountRootfs   = "com.urunc.unikernel.mountRootfs"
+-	annotNetDev        = "com.urunc.unikernel.solo5NetDev"
++	annotType           = "com.urunc.unikernel.unikernelType"
++	annotVersion        = "com.urunc.unikernel.unikernelVersion"
++	annotBinary         = "com.urunc.unikernel.binary"
++	annotCmdLine        = "com.urunc.unikernel.cmdline"
++	annotHypervisor     = "com.urunc.unikernel.hypervisor"
++	annotInitrd         = "com.urunc.unikernel.initrd"
++	annotBlock          = "com.urunc.unikernel.block"
++	annotBlockMntPoint  = "com.urunc.unikernel.blkMntPoint"
++	annotMountRootfs    = "com.urunc.unikernel.mountRootfs"
++	annotNetDev         = "com.urunc.unikernel.solo5NetDev"
++	annotSandboxProfile = "com.urunc.unikernel.sandboxProfile"
++)
++
++// Recognized values for annotSandboxProfile.
++const (
++	sandboxProfileArgo = "argo-workflow"
+ )
+ 
+ // A UnikernelConfig struct holds the info provided by bima image on how to execute our unikernel
+diff --git a/pkg/unikontainers/unikontainers.go b/pkg/unikontainers/unikontainers.go
+index b218c4c..352fcf1 100644
+--- a/pkg/unikontainers/unikontainers.go
++++ b/pkg/unikontainers/unikontainers.go
+@@ -1414,10 +1414,56 @@ func (u *Unikontainer) isRunning() bool {
+ 	return state == "running"
+ }
+ 
+-// getNetworkType checks if current container is a knative user-container
++// getNetworkType selects the network model for the guest. Knative
++// user-containers and Argo emissary "main" containers use "static" mode, which
++// skips the catch-all tc-redirect filter (addTCRules=false) that would
++// otherwise steal all inbound traffic on the shared pod netns and blind
++// co-located sidecars (e.g. Argo's wait sidecar). Every other container keeps
++// the default "dynamic" mode, unchanged.
+ func (u Unikontainer) getNetworkType() string {
+ 	if u.Spec.Annotations["io.kubernetes.cri.container-name"] == "user-container" {
+ 		return "static"
+ 	}
++	if argoWorkflowContext(u.Spec) {
++		return "static"
++	}
+ 	return "dynamic"
+ }
++
++// argoWorkflowContext reports whether this container should engage urunc's Argo
++// Workflows integration (static network mode + shim-side completion file).
++// Resolution order (Milestone 1 annotation profile):
++//  1. The com.urunc.unikernel.sandboxProfile annotation, when present, is
++//     authoritative: "argo-workflow" enables it; any other value (including
++//     "none" and "knative") disables it.
++//  2. When the annotation is absent, fall back to argv auto-detection so that
++//     annotation-less clusters keep the baseline behavior unchanged.
++func argoWorkflowContext(spec *specs.Spec) bool {
++	if spec == nil {
++		return false
++	}
++	switch spec.Annotations[annotSandboxProfile] {
++	case sandboxProfileArgo:
++		return true
++	case "":
++		return isArgoEmissaryMain(spec)
++	default:
++		return false
++	}
++}
++
++// isArgoEmissaryMain reports whether spec is an Argo Workflows "main" container
++// wrapped by the emissary executor. Argo rewrites the main container's command
++// to "<path>/argoexec emissary -- <user command>", so detection is a pure argv
++// check that needs no extra configuration. Returns false (legacy behavior) for
++// any spec that is nil, has no process, or does not match.
++func isArgoEmissaryMain(spec *specs.Spec) bool {
++	if spec == nil || spec.Process == nil {
++		return false
++	}
++	args := spec.Process.Args
++	if len(args) < 2 {
++		return false
++	}
++	return filepath.Base(args[0]) == "argoexec" && args[1] == "emissary"
++}

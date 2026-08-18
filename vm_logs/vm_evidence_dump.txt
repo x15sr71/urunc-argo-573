@@ -1,0 +1,52 @@
+################################################################
+# urunc x Argo — VM EVIDENCE DUMP   (Mon Aug 10 14:23:52 UTC 2026)
+# host: vidhya  urunc: urunc version 0.7.0-c6bcc89  k3s: k3s version v1.36.2+k3s1 (01b6f04a)
+################################################################
+
+===== [A] RESOURCE-TEMPLATE EVIDENCE (API-watch completion vs container-template hang) =====
+NAME                     STATUS      AGE    MESSAGE
+hello-world2             Succeeded   7d1h   
+urunc-repro              Running     7d1h   
+urunc-resource-success   Succeeded   80m    
+urunc-resource-test      Failed      82m    Error (exit code 64): failure condition '{status.phase == [Failed]}' evaluated true
+--- urunc-resource-test (Failed, real solo5 unikernel, detected via API) ---
+Failed  msg=Error (exit code 64): failure condition '{status.phase == [Failed]}' evaluated true
+2026-08-10T13:01:38Z -> 2026-08-10T13:01:49Z
+--- urunc-resource-success (Succeeded via API) ---
+Succeeded  2026-08-10T13:03:13Z -> 2026-08-10T13:03:24Z
+--- created unikernel pod (proof it was runtimeClass=urunc + solo5 ran) ---
+urunc-res-ok-c44vw  rtClass=urunc  phase=Succeeded
+urunc-res-pod-k2m8n  rtClass=urunc  phase=Failed
+
+===== [B] BLOCK I/O PRIMITIVE — solo5-spt mirage, no KVM, no shared-fs (10/10) =====
+2026-08-10T14:23:53-00:00: [INFO] [block] { Mirage_block.read_write = true;
+                                            sector_size = 512;
+                                            size_sectors = 100000L }
+2026-08-10T14:23:53-00:00: [INFO] [block] Total tests started: 10
+2026-08-10T14:23:53-00:00: [INFO] [block] Total tests passed:  10
+2026-08-10T14:23:53-00:00: [INFO] [block] Total tests failed:  0
+Solo5: solo5_exit(0) called
+--- solo5 device modules (net+block, NO fs — evidence for Blocker 2) ---
+
+===== [C] BLOCKER B (live) — urunc-repro eth0 ingress catch-all steal, still present 7d after main exit =====
+filter parent ffff: protocol all pref 49152 u32 chain 0 
+filter parent ffff: protocol all pref 49152 u32 chain 0 fh 800: ht divisor 1 
+filter parent ffff: protocol all pref 49152 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 terminal flowid not_in_hw 
+  match 00000000/00000000 at 0
+	action order 1: mirred (Egress Redirect to device tap0_urunc) stolen
+	index 2 ref 1 bind 1
+
+
+===== [D] BLOCKER 3 (live) — net-less mirage forced net in CNI pod => solo5 abort =====
+solo5-spt: Resource not declared in manifest: 'service'
+solo5-spt: Resource not declared in manifest: 'service'
+solo5-spt: Invalid option: `--net:service=tap0_urunc'
+usage: solo5-spt [ CORE OPTIONS ] [ -- ] KERNEL [ ARGS ]
+
+===== [E] SupportsSharedfs across monitors (VM source, Blocker 2) =====
+cloud_hypervisor.go:  | UsesKVM: returntrue
+firecracker.go: returnfalse | UsesKVM: returntrue
+hedge.go: returnfalse | UsesKVM: returntrue
+hvt.go: returnfalse | UsesKVM: returntrue
+qemu.go: returntrue | UsesKVM: returntrue
+spt.go: returnfalse | UsesKVM: returnfalse

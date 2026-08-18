@@ -1,0 +1,17 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: urunc-smoke-
+  namespace: argo
+spec:
+  serviceAccountName: argo
+  entrypoint: uni
+  templates:
+  - name: uni
+    podSpecPatch: '{"runtimeClassName":"urunc"}'
+    metadata:
+      annotations:
+        com.urunc.unikernel.sandboxProfile: "argo-workflow"
+    container:
+      image: harbor.nbfc.io/nubificus/urunc/hello-spt-rumprun-block-aarch64:latest
+      command: ["/hello"]
